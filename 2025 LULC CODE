@@ -1,0 +1,151 @@
+// S2 Imagery Filter & Processing
+//==================================================
+function maskS2clouds(image) {
+  var qa = image.select("QA60");
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+function selectBands(image) {
+  // 1. Calculate Indices
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename("NDVI");
+  var ndbi = image.normalizedDifference(['B11', 'B8']).rename("NDBI");
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename("MNDWI");
+  var ndsli = image.normalizedDifference(['B4', 'B11']).rename("NDSLI");
+  var rendvi = image.normalizedDifference(['B8', 'B5']).rename("reNDVI");
+  var gndvi = image.normalizedDifference(['B8', 'B3']).rename("GNDVI"); 
+  var savi = image.expression(
+    '((NIR - RED) / (NIR + RED + 0.5)) * (1.5)', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4')
+  }).rename("SAVI");
+
+  // 2. Add Topography (Essential for Tea vs Transitional Veg)
+  var terrain = ee.Algorithms.Terrain(ee.Image("USGS/SRTMGL1_003"));
+  var elevation = terrain.select('elevation');
+  var slope = terrain.select('slope');
+  
+  // 3. Define bands to keep (Included B5 for the Red-Edge calculation)
+  var bands = ["B4", "B3", "B2", "B5", "B8", "B11", "B12"];
+  
+  // 4. Return all bands and indices to the classifier
+  return image.select(bands)
+    .addBands([ndvi, mndwi, ndbi, ndsli, rendvi, gndvi, savi, elevation, slope]);
+}
+
+
+var imagery = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterDate('2025-11-30', '2025-12-03')
+  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 15))
+  .filterBounds(aoi)
+  .map(maskS2clouds)
+  .map(function(img) { return img.clip(aoi); })
+  .median();
+
+imagery = selectBands(imagery);
+Map.addLayer(imagery, {bands:['B4','B3','B2'], max:0.3}, "Sentinel-2 RGB", false);
+
+//===================================================
+// 2. Training and Testing Data Preparation
+//===================================================
+// Merge all your points and add a random column for splitting
+var train = ee.FeatureCollection('projects/ndvi-projects/assets/Training_Points_2025')
+// Print counts to Console to verify the fu
+//Validation Points for Accuracy Assessment
+var validation = ee.FeatureCollection('projects/ndvi-projects/assets/Validation_Points_2025')
+// Print counts to Console to verify the full dataset
+print('Total Training Points:', train.size());
+print('Training Class Distribution:', train.aggregate_histogram('LULC'));
+print('Total Validation Points:', validation.size());
+print('Validation Class Distribution:', validation.aggregate_histogram('LULC'));
+
+var trainSample = imagery.sampleRegions({
+  collection: train,
+  properties: ["LULC"],
+  scale: 10,
+  tileScale: 16
+});
+
+var testSample = imagery.sampleRegions({
+  collection: validation,
+  properties: ["LULC"],
+  scale: 10,
+  tileScale: 16
+});
+//===================================================
+// 3. Machine Learning Model (Random Forest)
+//===================================================
+// Regularized to prevent overfitting (memorization)
+var rf_model = ee.Classifier.smileRandomForest({
+  numberOfTrees: 150,
+  minLeafPopulation: 5, // Prevents over-deep trees
+  bagFraction: 0.5,      // Uses subsets of data for better generalization
+  seed: 0
+}).train({
+  features: trainSample,
+  classProperty: "LULC",
+  inputProperties: imagery.bandNames()
+});
+
+//===================================================
+// 4. Accuracy Assessment (For Thesis)
+//===================================================
+// Train Accuracy
+// Define the order of classes you actually have (1 to 7)
+var classOrder = [ 1,2, 3, 4, 5, 6, 7];
+
+// Train Accuracy Calculation
+var trainCm = trainSample.classify(rf_model, "predict")
+  .errorMatrix({
+    actual: "LULC", 
+    predicted: "predict", 
+    order: classOrder  // This forces GEE to use 1-7 and ignore 0
+  });
+
+print("Train Confusion Matrix:", trainCm);
+print("Train Overall Accuracy:", trainCm.accuracy());
+print("Train Kappa:", trainCm.kappa());
+
+// Test Accuracy (The "Honest" Result for your Thesis)
+var testCm = testSample.classify(rf_model, "predict").errorMatrix("LULC", "predict");
+print("Test Confusion Matrix:", testCm);
+print("Test Overall Accuracy:", testCm.accuracy());
+print("Test Kappa:", testCm.kappa());
+print("Producer's Accuracy (Omission):", testCm.producersAccuracy());//Indicates how well real land cover class is classified  and represents the emission error
+print("User's Accuracy (Reliability):", testCm.consumersAccuracy());//This shows how reliable a mapped class isand represents the comission error
+
+// 5. Visualization & Legend
+//===================================================
+var palette = ['00441b', '7fbc41', 'FFFF00', '8c510a', '000000', '4575b4', 'ff00ff'];
+var names = ["Indigenous Forest", "Plantation Forest", "Tea Farms", "BareLands", "Builtup", "Wetlands", "Regenerating Vegetation"];
+
+var lulc = imagery.classify(rf_model, "LULC").toByte();
+Map.addLayer(lulc, {min: 1, max: 7, palette: palette}, "LULC Classification");
+
+// Simple Legend
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legend.add(ui.Label({value: 'LULC Legend', style: {fontWeight: 'bold', fontSize: '16px'}}));
+for (var i = 0; i < names.length; i++) {
+  var colorBox = ui.Label({style: {backgroundColor: '#' + palette[i], padding: '8px', margin: '0 0 4px 0'}});
+  var description = ui.Label({value: names[i], style: {margin: '0 0 4px 6px'}});
+  legend.add(ui.Panel({widgets: [colorBox, description], layout: ui.Panel.Layout.Flow('horizontal')}));
+}
+Map.add(legend);
+
+// Export lulc to google drive
+Export.image.toDrive({
+  image: lulc,
+  scale: 10,
+  region: aoi,
+  crs: "EPSG:4326",
+  maxPixels: 1e13,
+ folder: "LULC",
+ description: "LULC_2025_MAU",
+  formatOptions: {
+   cloudOptimized: true,
+  },
+});
+
